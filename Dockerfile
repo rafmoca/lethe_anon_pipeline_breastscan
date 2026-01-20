@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1.19.0
 FROM debian:trixie-slim
+LABEL org.opencontainers.image.vendor="CBML, FORTH-ICS"
+LABEL vendor="CBML, FORTH-ICS"
+LABEL org.opencontainers.image.url="https://github.com/cbml-forth/lethe_anon_pipeline"
 LABEL org.opencontainers.image.description="LETHE Dicom Anonymization pipeline"
-LABEL org.opencontainers.image.licenses=EUPL-1.2
+LABEL description="LETHE Dicom Anonymization pipeline"
+LABEL org.opencontainers.image.licenses="EUPL-1.2"
 
 COPY --from=ghcr.io/astral-sh/uv:0.9.3 /uv /uvx /bin/
 
