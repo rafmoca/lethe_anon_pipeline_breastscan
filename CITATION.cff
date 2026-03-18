@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Sfakianakis"
+  given-names: "Stelios"
+  orcid: "https://orcid.org/0000-0001-8424-4157"
+- family-names: "Kalokyri"
+  given-names: "Varvara"
+  orcid: "https://orcid.org/0000-0002-5245-8238"
+title: "Lethe Anonymization Tool"
+version: 0.10.1
+doi: 10.5281/zenodo.19097245
+date-released: 2026-03-18
+url: "https://github.com/cbml-forth/lethe_anon_pipeline"
