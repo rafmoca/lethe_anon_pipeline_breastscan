@@ -16,6 +16,7 @@ from stdnum import luhn
 from typing_extensions import Annotated
 
 from .dcm_deidentify import run_ctp
+from .bscan_hashing import hash_BS_id
 from .defaults import (
     DEFAULT_CPU_THREADS,
     DEFAULT_IGNORE_CSV_PREFIX,
@@ -27,7 +28,7 @@ from .defaults import (
 from .dicom_utils import series_information, unique_patient_ids
 from .hash_clinical import hash_clinical_csvs
 from .ocr_deidentify import perform_ocr
-from .output_dir import copy_and_organize
+from .output_dir import copy_and_organize, copy_and_organize_parallel
 from .pseudo import PseudonymGenerator
 from .version import __version__
 
@@ -308,7 +309,6 @@ def export_lookup(
     console.print()
     console.print(table)
 
-
 @cli.command(help="Run the DICOM anonymization pipeline")
 def run(
     ctx: typer.Context,
@@ -316,6 +316,12 @@ def run(
         str,
         typer.Argument(
             help="The SITE-ID provided by the EUCAIM Technical team",
+        ),
+    ],
+    project_id: Annotated[
+        str,
+        typer.Argument(
+            help="The PROJECT-ID provided by the DATA HOLDER team",
         ),
     ],
     input_dir: Annotated[
@@ -331,6 +337,233 @@ def run(
             show_default=True,
         ),
     ] = OUTPUT_DIR,
+    bscan_dcm_deidentify: Annotated[
+        bool,
+        typer.Option(
+            "--bs_hash/--no-bs_hash",
+            help=(
+                "Perform deidentification in the DICOM metadata in image files. "
+                "Uses the RSNA CTP anonymizer and the custom script"
+            ),
+        ),
+    ] = True,
+    dcm_deidentify: Annotated[
+        bool,
+        typer.Option(
+            "--ctp/--no-ctp",
+            help=(
+                "Perform deidentification in the DICOM metadata in image files. "
+                "Uses the RSNA CTP anonymizer and the custom script"
+            ),
+        ),
+    ] = True,
+    pseudonymize: Annotated[
+        bool,
+        typer.Option(
+            "--pseudonymize",
+            help=(
+                "Perform pseudonymization by keeping a lookup table for patient ids in the `state-dir` folder."
+                "The generated pseudonyms will be of the form `{pseudonym_prefix}{number}`, "
+                "where the number is generated sequentially starting from 1 but reusing existing mappings."
+            ),
+        ),
+    ] = False,
+    ocr: Annotated[
+        bool,
+        typer.Option("--ocr", help="Perform OCR (using Tesseract OCR)"),
+    ] = False,
+    paddle_ocr: Annotated[
+        bool,
+        typer.Option(
+            "--paddle-ocr",
+            help="Perform OCR using PaddleOCR",
+        ),
+    ] = False,
+    threads: Annotated[
+        int,
+        typer.Option(
+            help="Number of threads that RSNA CTP and PaddleOCR (if enabled) will use",
+            show_default=True,
+        ),
+    ] = DEFAULT_CPU_THREADS,
+    pepper: Annotated[
+        str | None,
+        typer.Option(
+            "--secret",
+            help=(
+                "Use the supplied key as the secret key for the anonymization."
+                " This also enables 'pseudonymization', but in a diferrent way than the --pseudonymize flag:"
+                " the secret key given here will be used for hashing patient ids, so the generated pseudonyms"
+                " will be different than the ones generated with `--pseudonymize`."
+            ),
+        ),
+    ] = None,
+    hierarchical: Annotated[
+        bool,
+        typer.Option(
+            "--hierarchical/--no-hierarchical",
+            help=(
+                "Output files will be organized into a hierarchical "
+                "Patient / Study / Series folder structure using the anonymized UIDs "
+                "as the folder names"
+            ),
+        ),
+    ] = True,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable verbose logging"),
+    ] = False,
+    version: Annotated[
+        bool | None,
+        typer.Option(
+            "--version",
+            "-V",
+            callback=version_callback,
+            is_eager=True,
+            help="Print version information",
+        ),
+    ] = None,
+    pseudonym_prefix: Annotated[
+        str,
+        typer.Option(
+            help="The prefix to use for the patient's pseudonym id. You can use it as a template, passing '{site_id}' somewhere in it",
+            show_default=True,
+        ),
+    ] = "{site_id}_",
+    state_dir: Annotated[
+        str,
+        typer.Option(
+            help="The directory to use for storing state like lookup tables",
+            show_default=True,
+        ),
+    ] = str(DEFAULT_STATE_DIR),
+):
+
+    if paddle_ocr and ocr:
+        rich.print(
+            "[red][bold]Error:[/bold] Cannot use both PaddleOCR and TesseractOCR: please choose one, use --help for usage information[/red]"
+        )
+        sys.exit(1)
+
+    if not pepper:
+        pepper = _create_secret_key()  # Create a time based (UUIDv7) string as secret
+    elif not _valid_secret_key(pepper):
+        rich.print("[red][bold]Error:[/bold] Invalid secret key[/red]")
+        sys.exit(1)
+    
+    
+    import warnings
+    warnings.filterwarnings("ignore", message=".*exceeds the maximum length of 16 allowed for VR SH.*")
+
+    rich.print(_header_info())
+    logger.info(f"Running with {threads} threads")
+    pseudonym_gen: PseudonymGenerator | None = None
+    if pseudonymize:
+        pepper = site_id  # We overwrite the "secret" key to be the Site ID since we are pseudonymizing
+        pseudonym_gen = _make_pseudonym_generator(
+            state_dir=state_dir,
+            site_id=site_id,
+            pseudonym_prefix=pseudonym_prefix,
+        )
+        patient_ids = unique_patient_ids(input_dir)
+        for patient_id in patient_ids:
+            pseudonym_gen.assign(patient_id)
+
+    if verbose:
+        logger.debug(f"Using 'secret' key: {pepper}")
+
+    # Step 1: Run OCR if enabled
+    input_dir_images = input_dir.absolute()
+    output_dir = output_dir.absolute()
+    if ocr or paddle_ocr:
+        ocr_output_dir = Path(tempfile.mkdtemp())
+        perform_ocr(input_dir_images, ocr_output_dir, paddle_ocr, verbose, threads)
+        input_dir_images = ocr_output_dir
+
+    # Step 2: Run BreastScan patientID hashing.
+    if bscan_dcm_deidentify:
+        anon_script = Path(os.getcwd()) / "ctp" / "anon_BS.script"
+        logger.info("Running BreastScan hashing scheme.")
+        hash_output_dir = Path(tempfile.mkdtemp()) if hierarchical else output_dir
+        hash_BS_id(
+            input_dir=input_dir_images,
+            output_dir=hash_output_dir,
+            site_id=site_id,
+            project_id=project_id,
+            threads=threads,
+        )
+        input_dir_images = hash_output_dir
+    else:
+        anon_script = Path(os.getcwd()) / "ctp" / "anon.script"
+
+    # Step 3: Run data anonymization
+    if dcm_deidentify:
+        ctp_output_dir = Path(tempfile.mkdtemp()) if hierarchical else output_dir
+        run_ctp(
+            input_dir=input_dir_images,
+            output_dir=ctp_output_dir,
+            anon_script=anon_script,
+            site_id=site_id,
+            pepper=pepper,
+            threads=threads,
+            pseudonym_generator=pseudonym_gen,
+        )
+        input_dir_images = ctp_output_dir
+
+    # Step 4: Copy and organize files if hierarchical if needed
+    if input_dir_images != output_dir:
+        logger.info("Copying and reorganizing files.")
+        #copy_and_organize(input_dir_images, output_dir, restructure=hierarchical)
+        copy_and_organize_parallel(input_dir_images, output_dir, restructure=hierarchical, threads = threads) # Version with parallelization
+
+    # Step 5: Hash any clinical CSVs found in the input directory:
+    if dcm_deidentify:
+        hash_clinical_csvs(
+            input_dir,
+            output_dir,
+            secret_key=pepper,
+            verbose=verbose,
+            pseudonym_generator=pseudonym_gen,
+        )
+
+@cli.command(help="Run the DICOM anonymization pipeline")
+def run_old(
+    ctx: typer.Context,
+    site_id: Annotated[
+        str,
+        typer.Argument(
+            help="The SITE-ID provided by the EUCAIM Technical team",
+        ),
+    ],
+    project_id: Annotated[
+        str,
+        typer.Argument(
+            help="The PROJECT-ID provided by the DATA HOLDER team",
+        ),
+    ],
+    input_dir: Annotated[
+        Path,
+        typer.Argument(
+            help="Input directory to read DICOM files from", show_default=True
+        ),
+    ] = INPUT_DIR,
+    output_dir: Annotated[
+        Path,
+        typer.Argument(
+            help="Output directory to write processed DICOM files to",
+            show_default=True,
+        ),
+    ] = OUTPUT_DIR,
+    bscan_dcm_deidentify: Annotated[
+        bool,
+        typer.Option(
+            "--bs_hash/--no-bs_hash",
+            help=(
+                "Perform deidentification in the DICOM metadata in image files. "
+                "Uses the RSNA CTP anonymizer and the custom script"
+            ),
+        ),
+    ] = True,
     dcm_deidentify: Annotated[
         bool,
         typer.Option(
@@ -459,9 +692,13 @@ def run(
         perform_ocr(input_dir_images, ocr_output_dir, paddle_ocr, verbose, threads)
         input_dir_images = ocr_output_dir
 
+
     # Step 2: Run RSNA CTP
     if dcm_deidentify:
-        anon_script = Path(os.getcwd()) / "ctp" / "anon.script"
+        if bscan_dcm_deidentify:
+            anon_script = Path(os.getcwd()) / "ctp" / "anon_BS.script"
+        else:
+            anon_script = Path(os.getcwd()) / "ctp" / "anon.script"
         ctp_output_dir = Path(tempfile.mkdtemp()) if hierarchical else output_dir
         run_ctp(
             input_dir=input_dir_images,
@@ -474,18 +711,32 @@ def run(
         )
         input_dir_images = ctp_output_dir
 
+    # Step 3: Hash with BreastScan hashing scheme if necessary:
+    if bscan_dcm_deidentify:
+        print("BreastScan hashing adaptation enabled!")
+        hash_output_dir = Path(tempfile.mkdtemp()) if hierarchical else output_dir
+        run_hashing(
+            input_dir=input_dir_images,
+            output_dir=hash_output_dir,
+            site_id=site_id,
+            project_id=project_id,
+            threads=threads,
+        )
+        input_dir_images = hash_output_dir
+
     # Step 3: Copy and organize files if hierarchical if needed
     if input_dir_images != output_dir:
         copy_and_organize(input_dir_images, output_dir, restructure=hierarchical)
 
     # Step 4: Hash any clinical CSVs found in the input directory:
-    hash_clinical_csvs(
-        input_dir,
-        output_dir,
-        secret_key=pepper,
-        verbose=verbose,
-        pseudonym_generator=pseudonym_gen,
-    )
+    if dcm_deidentify:
+        hash_clinical_csvs(
+            input_dir,
+            output_dir,
+            secret_key=pepper,
+            verbose=verbose,
+            pseudonym_generator=pseudonym_gen,
+        )
 
 
 if __name__ == "__main__":

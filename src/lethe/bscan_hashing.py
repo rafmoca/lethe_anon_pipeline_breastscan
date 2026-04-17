@@ -1,0 +1,273 @@
+from queue import Queue
+from threading import Thread
+import pydicom
+import os
+from pathlib import Path
+from tqdm import tqdm
+from .encryptor import IdentifierEncryptor
+from loguru import logger
+
+def hash_dicom(
+    dicom_file: Path, 
+    output_file: Path, 
+    encryptor: IdentifierEncryptor, 
+    tag_mapping: dict
+):
+    try:
+        ds = pydicom.dcmread(dicom_file)
+        
+        for name, info in tag_mapping.items():
+            tag_hex = info['tag']
+            # Convert '00100010' string to a pydicom Tag object or hex integer
+            tag_int = int(tag_hex, 16)
+            
+            if tag_int in ds:
+                original_value = str(ds[tag_int].value)
+                # Encrypt and update the specific tag
+                ds[tag_int].value = encryptor.encrypt(original_value)
+        
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        ds.save_as(output_file)
+    except Exception as e:
+        print(f"Error processing {dicom_file}: {e}")
+
+def hash_dicom_uid_ready(
+    dicom_file: Path, 
+    output_file: Path, 
+    encryptor: IdentifierEncryptor, 
+    tag_mapping: dict
+):
+    try:
+        ds = pydicom.dcmread(dicom_file)
+        
+        for name, info in tag_mapping.items():
+            tag_int = int(info['tag'], 16)
+            
+            if tag_int in ds:
+                original_value = str(ds[tag_int].value)
+                
+                # 1. Get raw encrypted bytes from the engine
+                # Note: Assuming IdentifierEncryptor.encrypt now returns bytes 
+                # or you use a helper that does.
+                encrypted_bytes = encryptor.encrypt(original_value)
+                
+                if name.endswith("ID"):
+                    # 2. UID Logic: Convert bytes to a large integer and add OID root
+                    # This ensures the value contains only digits and dots
+                    big_int = int.from_bytes(encrypted_bytes, byteorder='big')
+                    hashed_value = f"2.25.{big_int}"
+                    
+                    # 3. DICOM Safety Check
+                    # If this exceeds 64 chars, you'll need to use a single-block 
+                    # encryption strategy or truncate (which loses reversibility)
+                    if len(hashed_value) > 64:
+                        hashed_value = hashed_value[:64]
+                else:
+                    # 4. Standard Tag Logic: Convert bytes to Hex
+                    hashed_value = encrypted_bytes.hex()
+
+                print(f"Tag name: {name}, original value: {original_value}")
+                print(f"Original value: {original_value} , length {len(original_value)}")
+                print(f"Hashed value: {hashed_value} , length {len(hashed_value)}")              
+
+                # Update the tag value
+                ds[tag_int].value = hashed_value
+        
+        # Save the structured file
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        ds.save_as(output_file)
+        
+    except Exception as e:
+        print(f"Error processing {dicom_file.name}: {e}")
+
+def hash_patient_id(
+    dicom_file: Path, 
+    output_file: Path, 
+    encryptor: IdentifierEncryptor, 
+    tag_mapping: dict
+):
+    """
+    # pydicom overwrite configuration:
+    config.enforce_valid_values = False
+    # 2. Prevent pydicom from crashing when it encounters existing non-standard data
+    pydicom.config.settings.reading_validation_mode = pydicom.config.IGNORE
+    pydicom.config.settings.writing_validation_mode = pydicom.config.IGNORE
+    settings.reading_validation_mode = 0 
+    settings.writing_validation_mode = 0
+    """
+    #import base64
+
+    try:
+        ds = pydicom.dcmread(dicom_file)
+        
+        for name, info in tag_mapping.items():
+            tag_int = int(info['tag'], 16)
+            
+            if tag_int in ds:
+                original_value = str(ds[tag_int].value)
+                if not original_value:
+                    continue
+
+                #print(f"Tag name: {name}, original value: {original_value}, length {len(original_value)}")
+
+                #if len(original_value)>32:
+                #    original_value = original_value[:32]
+                # 1. Get raw encrypted bytes from the engine
+                # Note: Assuming IdentifierEncryptor.encrypt now returns bytes 
+                # or you use a helper that does.
+                try:
+                    encrypted_bytes = encryptor.encrypt(original_value)
+                except Exception as e:
+                    print(f"Encryption failed for file {dicom_file} tag {name} with value length {len(original_value)}: {e}")
+                    raise
+
+
+                #big_int = int.from_bytes(encrypted_bytes, byteorder='big')
+                #hashed_value = f"2.25.{big_int}"
+                hashed_value = encrypted_bytes.hex()
+                #hashed_value = base64.b64encode(encrypted_bytes).decode()
+                #ds[tag_int].validation_mode = pydicom.config.IGNORE
+                ds[tag_int].value = hashed_value
+        
+        # Save the structured file
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        ds.save_as(output_file)
+
+    except Exception as e:
+        print(f"Error processing {dicom_file.name}: {e}")
+
+# Multithreading code to hash files at the same time
+def producer(
+    input_dir: Path, 
+    task_queue: Queue, 
+    num_consumers: int
+):
+    """Finds all DICOM files and adds them to the queue."""
+    for root, _, files in os.walk(input_dir):
+        for file in files:
+            if file.lower().endswith(".dcm"):
+                task_queue.put(Path(root) / file)
+    
+    # Signal consumers to stop
+    for _ in range(num_consumers):
+        task_queue.put(None)
+
+def consumer(
+    task_queue: Queue, 
+    input_dir: Path, 
+    output_dir: Path, 
+    encryptor: IdentifierEncryptor, 
+    tag_mapping: dict
+):
+    """Processes files from the queue."""
+    while True:
+        file_path = task_queue.get()
+        if file_path is None:
+            task_queue.task_done()
+            break
+        
+        # Maintain directory structure: Patient/Study/Series/file.dcm
+        rel_path = file_path.relative_to(input_dir)
+        target_path = output_dir / rel_path
+        
+        #hash_dicom_uid_ready(file_path, target_path, encryptor, tag_mapping)
+        hash_patient_id(file_path, target_path, encryptor, tag_mapping)
+        task_queue.task_done()
+
+# This function runs the hashing of the files in a multithreaded manner by paralellizing at the dicom level
+def hash_BS_id(
+    input_dir: Path, # folder containing all the data
+    output_dir: Path,
+    site_id: str,
+    project_id:str,
+    threads: int,
+):
+    """
+    # tag mapping dictionary for all of the hashed dicom tags
+        tag_mapping_hex = {
+            'PatientName': {'tag': '00100010'}, 
+            'PatientID': {'tag': '00100020'}, 
+            'AccessionNumber': {'tag': '00080050'}, 
+            'AcquisitionUID': {'tag': '00080017'},
+            'StudyDescription': {'tag': '00081030'},
+            'StudyInstanceUID': {'tag': '0020000D'},
+            'SeriesInstanceUID': {'tag': '0020000E'},
+            'FrameOfReferenceUID': {'tag': '00200052'},
+            'InstanceCreatorUID': {'tag': '00080014'},
+            'SOPInstanceUID': {'tag': '00080018'},
+            'OverlayDate': {'tag': '00080024'},
+            'CurveDate': {'tag': '00080025'},
+            'RefSOPInstanceUID': {'tag': '00081155'},
+            'IrradiationEventUID': {'tag': '00083010'},
+            'DeviceUID': {'tag': '00181002'},
+            'TargetUID': {'tag': '00182042'},
+            'SourceStartDateTime': {'tag': '00189369'},
+            'StartAcquisitionDateTime': {'tag': '00189516'},
+            'EndAcquisitionDateTime': {'tag': '00189517'},
+            'SynchronizationFrameOfReferenceUID': {'tag': '00200200'},
+            'ConcatenationUID': {'tag': '00209161'},
+            'DimensionOrganizationUID': {'tag': '00209164'},
+            'PaletteColorLUTUID': {'tag': '00281199'},
+            'LargePaletteColorLUTUID': {'tag': '00281214'},
+            'SpecimenUID': {'tag': '00400554'},
+            'UID': {'tag': '0040A124'},
+        }
+    """
+
+    # 
+    tag_mapping_hex = {
+        'PatientID': {'tag': '00100020'}
+    }
+    # One thread finds all the dicom files (the producer) and distributes them to the rest of the threads (the consumers) for hashing 
+    task_queue = Queue(maxsize=5000)
+    encryptor = IdentifierEncryptor(site_id, project_id)
+    
+    num_consumers = max(1, threads - 1)
+    # Launch Workers
+    workers = []
+    for _ in range(num_consumers):
+        t = Thread(target=consumer, args=(task_queue, input_dir, output_dir, encryptor, tag_mapping_hex))
+        t.daemon = True
+        t.start()
+        workers.append(t)
+
+    # Launch Producer
+    producer_thread = Thread(target=producer, args=(input_dir, task_queue, num_consumers))
+    producer_thread.start()
+
+    producer_thread.join()
+    for t in workers:
+        t.join()
+
+    #print(f"Successfully hashed DICOM files with the BreastScan hashing scheme.")
+
+
+
+
+
+
+
+
+"""
+    tag_mapping = {
+        'PatientName': {'tag': (16, 16), 'is_identifier': False}, 
+        'PatientID': {'tag': (16, 32), 'is_identifier': True}, 
+        'StudyDate': {'tag': (8, 32), 'is_identifier': False}, 
+        'Modality': {'tag': (8, 96), 'is_identifier': False}, 
+        'AccessionNumber': {'tag': (8, 80), 'is_identifier': False}, 
+        'StudyDescription': {'tag': (8, 4144), 'is_identifier': False}, 
+        'StudyUID': {'tag': (32, 13), 'is_identifier': True}, 
+        'StudyTime': {'tag': (8, 48), 'is_identifier': False},
+        'SerieUID': {'tag': (32, 14), 'is_identifier': False}
+    }
+    tag_mapping = {
+        'PatientName': {'tag': (16, 16)}, 
+        'PatientID': {'tag': (16, 32)}, 
+        'AccessionNumber': {'tag': (8, 80)}, 
+        'AcquisitionUID': {'tag': (8, 23)},
+        'StudyDescription': {'tag': (8, 4144)},
+        'StudyInstanceUID': {'tag': (32, 13)},
+        'SeriesInstanceUID': {'tag': (32, 14),},
+        'FrameOfReferenceUID': {'tag': (32, 82),},
+    }    
+"""

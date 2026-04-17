@@ -88,3 +88,30 @@ def dcm_generator(input_folder: Path | str) -> Generator[DcmFileInfo, None, None
                 )
             except Exception:
                 continue
+
+BS_DcmFileInfo = namedtuple(
+    "DcmFileInfo",
+    [
+        "path",
+        "patient_id",
+        "study_uid",
+        "series_uid",
+        "instance_number",
+    ],
+)
+
+def BS_dcm_generator(input_folder: Path | str) -> Generator[DcmFileInfo, None, None]:
+    for root, dirs, files in os.walk(os.fspath(input_folder), topdown=True):
+        for file in files:
+            file_path = os.path.join(root, file)
+            try:
+                ds: FileDataset = dcmread(file_path, stop_before_pixels=True)
+                yield BS_DcmFileInfo(
+                    Path(file_path),
+                    ds.PatientID,
+                    ds.StudyInstanceUID,
+                    ds.SeriesInstanceUID,
+                    ds.InstanceNumber,
+                )
+            except Exception:
+                continue
