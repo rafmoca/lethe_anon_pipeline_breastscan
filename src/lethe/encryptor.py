@@ -62,35 +62,3 @@ class IdentifierEncryptor:
         unpader = padding.PKCS7(128).unpadder()
         data = unpader.update(padded_data) + unpader.finalize()
         return data.decode()
-
-    def encrypt_with_pad(self, identifier: str) -> bytes:
-        if len(identifier) > 30:
-            raise ValueError("Identifier must have 30 characters or less.")
-
-        pad_count = 30 - len(identifier)
-        padded_identifier = identifier + ("X" * pad_count) + f"{pad_count:02}"
-
-        data = padded_identifier.encode()
-
-        cipher = Cipher(
-            algorithms.AES(self.key),
-            modes.CBC(self.iv),
-            backend=self.backend
-        )
-
-        encryptor = cipher.encryptor()
-        return encryptor.update(data) + encryptor.finalize()
-
-
-    def decrypt_with_pad(self, encrypted_data: bytes) -> str:
-        cipher = Cipher(
-            algorithms.AES(self.key),
-            modes.CBC(self.iv),
-            backend=self.backend
-        )
-
-        decryptor = cipher.decryptor()
-        decoded = (decryptor.update(encrypted_data) + decryptor.finalize()).decode()
-
-        pad_count = int(decoded[-2:])
-        return decoded[:30 - pad_count]

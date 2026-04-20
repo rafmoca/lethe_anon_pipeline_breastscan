@@ -31,55 +31,6 @@ def hash_dicom(
     except Exception as e:
         print(f"Error processing {dicom_file}: {e}")
 
-def hash_dicom_uid_ready(
-    dicom_file: Path, 
-    output_file: Path, 
-    encryptor: IdentifierEncryptor, 
-    tag_mapping: dict
-):
-    try:
-        ds = pydicom.dcmread(dicom_file)
-        
-        for name, info in tag_mapping.items():
-            tag_int = int(info['tag'], 16)
-            
-            if tag_int in ds:
-                original_value = str(ds[tag_int].value)
-                
-                # 1. Get raw encrypted bytes from the engine
-                # Note: Assuming IdentifierEncryptor.encrypt now returns bytes 
-                # or you use a helper that does.
-                encrypted_bytes = encryptor.encrypt(original_value)
-                
-                if name.endswith("ID"):
-                    # 2. UID Logic: Convert bytes to a large integer and add OID root
-                    # This ensures the value contains only digits and dots
-                    big_int = int.from_bytes(encrypted_bytes, byteorder='big')
-                    hashed_value = f"2.25.{big_int}"
-                    
-                    # 3. DICOM Safety Check
-                    # If this exceeds 64 chars, you'll need to use a single-block 
-                    # encryption strategy or truncate (which loses reversibility)
-                    if len(hashed_value) > 64:
-                        hashed_value = hashed_value[:64]
-                else:
-                    # 4. Standard Tag Logic: Convert bytes to Hex
-                    hashed_value = encrypted_bytes.hex()
-
-                print(f"Tag name: {name}, original value: {original_value}")
-                print(f"Original value: {original_value} , length {len(original_value)}")
-                print(f"Hashed value: {hashed_value} , length {len(hashed_value)}")              
-
-                # Update the tag value
-                ds[tag_int].value = hashed_value
-        
-        # Save the structured file
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        ds.save_as(output_file)
-        
-    except Exception as e:
-        print(f"Error processing {dicom_file.name}: {e}")
-
 def hash_patient_id(
     dicom_file: Path, 
     output_file: Path, 
@@ -95,8 +46,6 @@ def hash_patient_id(
     settings.reading_validation_mode = 0 
     settings.writing_validation_mode = 0
     """
-    #import base64
-
     try:
         ds = pydicom.dcmread(dicom_file)
         
@@ -108,25 +57,14 @@ def hash_patient_id(
                 if not original_value:
                     continue
 
-                #print(f"Tag name: {name}, original value: {original_value}, length {len(original_value)}")
-
-                #if len(original_value)>32:
-                #    original_value = original_value[:32]
-                # 1. Get raw encrypted bytes from the engine
                 # Note: Assuming IdentifierEncryptor.encrypt now returns bytes 
-                # or you use a helper that does.
                 try:
                     encrypted_bytes = encryptor.encrypt(original_value)
                 except Exception as e:
                     print(f"Encryption failed for file {dicom_file} tag {name} with value length {len(original_value)}: {e}")
                     raise
 
-
-                #big_int = int.from_bytes(encrypted_bytes, byteorder='big')
-                #hashed_value = f"2.25.{big_int}"
                 hashed_value = encrypted_bytes.hex()
-                #hashed_value = base64.b64encode(encrypted_bytes).decode()
-                #ds[tag_int].validation_mode = pydicom.config.IGNORE
                 ds[tag_int].value = hashed_value
         
         # Save the structured file
@@ -170,7 +108,6 @@ def consumer(
         rel_path = file_path.relative_to(input_dir)
         target_path = output_dir / rel_path
         
-        #hash_dicom_uid_ready(file_path, target_path, encryptor, tag_mapping)
         hash_patient_id(file_path, target_path, encryptor, tag_mapping)
         task_queue.task_done()
 
@@ -214,7 +151,6 @@ def hash_BS_id(
         }
     """
 
-    # 
     tag_mapping_hex = {
         'PatientID': {'tag': '00100020'}
     }
