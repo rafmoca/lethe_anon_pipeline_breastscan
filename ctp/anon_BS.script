@@ -219,7 +219,7 @@
  <e en="T" n="FrameDisplaySeq" t="00089458">@remove()</e>
  <e en="T" n="RecommendedDisplayFrameRateInFloat" t="00089459">@remove()</e>
  <e en="T" n="SkipFrameRangeFlag" t="00089460">@remove()</e>
- <e en="T" n="PatientName" t="00100010">@param(EUCAIM-)@hashptid(@SECRET_KEY,PatientID)@param(^Anonymous)</e>
+ <e en="T" n="PatientName" t="00100010">@keep()</e>
  <e en="T" n="PatientID" t="00100020">@keep()</e>
  <e en="T" n="IssuerOfPatientID" t="00100021">@remove()</e>
  <e en="T" n="TypeOfPatientID" t="00100022">@keep()</e>
